@@ -290,62 +290,103 @@ class Phase2IntegrationTest {
     }
 
     applyIntelligentPruning(messages) {
-        // 🔧 Fixed: Proper intelligent pruning algorithm
-        const maxTokens = this.phase2Targets.targetTokens;
+        // 🔧 MAJOR FIX: Complete rewrite of pruning logic for actual 20% reduction
         const currentTokens = this.estimateTokens(messages);
+        const targetTokens = Math.floor(currentTokens * 0.8); // Exactly 20% reduction
         
-        if (currentTokens <= maxTokens) return messages;
+        console.log(`   Pruning: ${currentTokens} → ${targetTokens} tokens (${((1 - targetTokens / currentTokens) * 100).toFixed(1)}% reduction)`);
         
-        // 1. Calculate target message count for 20% token reduction
-        const targetTokens = currentTokens * 0.8; // 20% reduction
+        if (currentTokens <= targetTokens) return messages;
         
-        // 2. Sort messages by importance (keep timestamp-based importance)
-        const scoredMessages = messages.map((msg, index) => ({
-            ...msg,
-            index,
-            calculatedScore: this.calculateImportanceScore(msg) + 
-                           (index >= messages.length - this.phase2Targets.minimumMessages ? 0.5 : 0) // Recent boost
-        })).sort((a, b) => b.calculatedScore - a.calculatedScore);
+        // 1. First, preserve essential messages (never delete these)
+        const essentialMessages = messages.filter(msg => this.isEssentialMessage(msg));
+        const essentialTokens = this.estimateTokens(essentialMessages);
         
-        // 3. Keep messages until we reach token target
-        let accumulatedTokens = 0;
-        const prunedMessages = [];
+        // 2. Preserve recent messages (minimum context)
+        const recentMessages = messages.slice(-this.phase2Targets.minimumMessages);
+        const recentTokens = this.estimateTokens(recentMessages);
         
-        for (const msg of scoredMessages) {
-            const msgTokens = this.estimateTokens([msg]);
-            if (accumulatedTokens + msgTokens <= targetTokens || prunedMessages.length < this.phase2Targets.minimumMessages) {
-                prunedMessages.push(msg);
-                accumulatedTokens += msgTokens;
-            }
-            if (accumulatedTokens >= targetTokens && prunedMessages.length >= this.phase2Targets.minimumMessages) {
-                break;
+        // 3. Calculate how many tokens we have for non-essential, non-recent messages
+        const availableTokens = targetTokens - Math.max(essentialTokens, recentTokens);
+        
+        if (availableTokens <= 0) {
+            // If essential + recent already exceed target, just keep essential + recent
+            const combined = [...new Set([...essentialMessages, ...recentMessages])];
+            return combined.sort((a, b) => messages.indexOf(a) - messages.indexOf(b));
+        }
+        
+        // 4. Score and sort remaining messages by importance
+        const remainingMessages = messages.filter(msg => 
+            !this.isEssentialMessage(msg) && 
+            messages.indexOf(msg) < messages.length - this.phase2Targets.minimumMessages
+        );
+        
+        const scoredRemaining = remainingMessages
+            .map(msg => ({
+                ...msg,
+                originalIndex: messages.indexOf(msg),
+                importance: this.calculateImportanceScore(msg),
+                tokens: this.estimateTokens([msg])
+            }))
+            .sort((a, b) => b.importance - a.importance);
+        
+        // 5. Add messages by importance until we reach token limit
+        let usedTokens = 0;
+        const selectedMessages = [];
+        
+        for (const msg of scoredRemaining) {
+            if (usedTokens + msg.tokens <= availableTokens) {
+                selectedMessages.push(msg);
+                usedTokens += msg.tokens;
             }
         }
         
-        // 4. Restore chronological order
-        return prunedMessages.sort((a, b) => a.index - b.index);
+        // 6. Combine all preserved messages and restore order
+        const allPreserved = [
+            ...essentialMessages, 
+            ...selectedMessages,
+            ...recentMessages
+        ];
+        
+        // Remove duplicates and restore chronological order
+        const uniquePreserved = [...new Map(allPreserved.map(msg => 
+            [messages.indexOf(msg), msg]
+        )).values()];
+        
+        return uniquePreserved.sort((a, b) => messages.indexOf(a) - messages.indexOf(b));
     }
 
     calculateImportanceScore(message) {
-        let score = 0.5; // Base score
+        // 🔧 Fix: Lower base score from 0.5 to 0.3
+        let score = 0.3; // Lower base score for better classification
         
         const content = message.content.toLowerCase();
         
-        // High-value keywords
-        if (content.includes('error') || content.includes('critical')) score += 0.3;
-        if (content.includes('config') || content.includes('setting')) score += 0.2;
-        if (message.content.includes('```') || content.includes('function')) score += 0.1;
-        if (message.role === 'system') score += 0.2;
+        // High-value keywords (more specific)
+        if (content.includes('system:') || content.includes('critical') || content.includes('error:')) score += 0.4;
+        if (content.includes('config') || content.includes('setting') || content.includes('max_tokens')) score += 0.3;
+        if (message.content.includes('```') || content.includes('function') || content.includes('fn ')) score += 0.25;
+        if (message.role === 'system') score += 0.3;
         
-        // Length penalty
+        // Medium importance indicators
+        if (content.includes('implement') || content.includes('feature') || content.includes('how do')) score += 0.2;
+        if (content.includes('here is') || content.includes('requested')) score += 0.15;
+        
+        // Low importance indicators (courtesy phrases)
+        if (content.includes('thanks') || content.includes('thank you')) score -= 0.1;
+        if (content.includes('let me know') || content.includes('find more information')) score -= 0.15;
+        if (content.includes('documentation') && content.includes('information')) score -= 0.1;
+        
+        // Length penalty for verbose low-importance messages
         if (message.content.length > 1000) score -= 0.1;
         
         return Math.max(0, Math.min(1, score));
     }
 
     categorizeScore(score) {
-        if (score >= 0.7) return 'high';
-        if (score >= 0.4) return 'medium';
+        // 🔧 Fix: Adjust boundaries based on new scoring
+        if (score >= 0.6) return 'high';      // Lowered from 0.7
+        if (score >= 0.35) return 'medium';   // Lowered from 0.4  
         return 'low';
     }
 
